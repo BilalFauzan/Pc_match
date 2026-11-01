@@ -937,56 +937,195 @@ with tabs[3]:
         st.info("Run optimization in Tab 2 to generate simulation include decks.")
     else:
         sm = st.session_state['scal_manager']
-        opt_params = st.session_state['opt_results']['stage2']['optimal_parameters']
+        opt_res = st.session_state['opt_results']
+        stg1_params = opt_res['stage1']['optimal_multipliers']
+        stg2_params = opt_res['stage2']['optimal_parameters']
+        gd = st.session_state['grid_data']
+        p_unit = gd.get('p_unit', 'bar')
+        active_rts = sorted(list(sm.tables.keys()))
 
-        # Apply parameters to manager
-        sm.apply_multipliers_dict(opt_params)
+        st.subheader("Simulation-Ready Include Files (.GRDECL) Export")
+        st.write("Ekspor kurva saturasi SCAL hasil optimasi ke dalam format keyword `SWOF` dan `SGOF` standar ECLIPSE & tNavigator.")
 
-        st.subheader("Download Simulation-Ready Include Files (.GRDECL)")
-        st.write("Generated decks comply strictly with ECLIPSE & tNavigator SWOF/SGOF keyword syntax.")
+        # Pre-generate Stage 1 and Stage 2 ZIP archives for instant 1-click download
+        # Stage 1 ZIP (Multiplier-Only)
+        sm.apply_multipliers_dict(stg1_params)
+        zip_buf_stg1 = io.BytesIO()
+        with zipfile.ZipFile(zip_buf_stg1, "w", zipfile.ZIP_DEFLATED) as zf1:
+            for r_id in active_rts:
+                c1 = sm.export_scal_string(r_id, stage_label="Stage 1 (Multiplier-Only)")
+                zf1.writestr(f"RT-{r_id}_opt.GRDECL", c1)
 
-        # ZIP archive preparation
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-            for r_id in sm.tables.keys():
-                content = sm.export_scal_string(r_id)
-                zf.writestr(f"RT-{r_id}_opt.GRDECL", content)
+        # Stage 2/3 ZIP (Multi-Parameter)
+        sm.apply_multipliers_dict(stg2_params)
+        zip_buf_stg2 = io.BytesIO()
+        with zipfile.ZipFile(zip_buf_stg2, "w", zipfile.ZIP_DEFLATED) as zf2:
+            for r_id in active_rts:
+                c2 = sm.export_scal_string(r_id, stage_label="Stage 2/3 (Multi-Parameter)")
+                zf2.writestr(f"RT-{r_id}_opt.GRDECL", c2)
 
-        st.download_button(
-            label="📦 Download All Optimized SCAL Files (.ZIP)",
-            data=zip_buffer.getvalue(),
-            file_name="Optimized_SCAL_Decks.zip",
-            mime="application/zip",
-            type="primary",
-            use_container_width=True
+        # Quick Batch Download Buttons
+        st.markdown("#### 📦 Quick Batch Download (.ZIP)")
+        col_z1, col_z2 = st.columns(2)
+        with col_z1:
+            st.download_button(
+                label="⚡ Download All as Stage 1 (.ZIP)\n(Multiplier-Only / Lab Curvature Preserved)",
+                data=zip_buf_stg1.getvalue(),
+                file_name="Optimized_SCAL_Decks_Stage1_MultiplierOnly.zip",
+                mime="application/zip",
+                use_container_width=True
+            )
+            st.caption("Direkomendasikan jika ingin mempertahankan kurva lab asli dan mencegah keruntuhan asimtot (misal RT-4).")
+
+        with col_z2:
+            st.download_button(
+                label="🎯 Download All as Stage 2/3 (.ZIP)\n(Full Multi-Parameter: Alpha, Swirr, Pce, Beta)",
+                data=zip_buf_stg2.getvalue(),
+                file_name="Optimized_SCAL_Decks_Stage2_MultiParam.zip",
+                mime="application/zip",
+                type="primary",
+                use_container_width=True
+            )
+            st.caption("Kalibrasi penuh seluruh parameter untuk meminimalkan spatial saturation mismatch (RMSE minimum).")
+
+        st.write("---")
+
+        # Interactive Formulation Selector for Preview & Customization
+        st.markdown("#### 🎛️ Konfigurasi Formulasi Ekspor & Code Preview")
+        export_mode = st.radio(
+            "Pilih formulasi aktif untuk pratinjau tabel dan download file individual:",
+            [
+                "⚡ Stage 1 (Multiplier-Only): Seluruh Rock Type",
+                "🎯 Stage 2/3 (Multi-Parameter): Seluruh Rock Type",
+                "🔀 Kustom / Hybrid: Tentukan Formulasi per Rock Type"
+            ],
+            index=0 if "Stage 1" in opt_stage else 1,
+            horizontal=False,
+            help="Pilih Stage 1 untuk menjaga kelengkungan lab asli, Stage 2/3 untuk tuning multi-parameter, atau Hybrid untuk mencampur (misal RT-4 memakai Stage 1 dan lainnya memakai Stage 2/3)."
         )
+
+        selected_export_params = {}
+        stage_descriptions = {}
+
+        if export_mode.startswith("⚡ Stage 1"):
+            for r in active_rts:
+                selected_export_params[r] = stg1_params.get(r, 1.0)
+                stage_descriptions[r] = "Stage 1 (Multiplier-Only)"
+            active_zip_name = "Optimized_SCAL_Decks_Stage1_MultiplierOnly.zip"
+            st.info("⚡ **Mode Aktif: Stage 1 (Multiplier-Only)** — Hanya mengubah skala vertikal Pc dengan faktor pengali $\\alpha^*$. Bentuk kelengkungan asimtotik data laboratorium asli, titik $S_{wirr}$, dan $P_{ce}=0$ dipertahankan 100%.")
+
+        elif export_mode.startswith("🎯 Stage 2/3"):
+            for r in active_rts:
+                selected_export_params[r] = stg2_params.get(r, {'alpha': 1.0, 'swirr': sm.tables[r].base_swirr, 'pce': 0.0, 'beta': 1.0})
+                stage_descriptions[r] = "Stage 2/3 (Multi-Parameter)"
+            active_zip_name = "Optimized_SCAL_Decks_Stage2_MultiParam.zip"
+            st.info("🎯 **Mode Aktif: Stage 2/3 (Multi-Parameter)** — Kalibrasi komprehensif seluruh parameter ($\\alpha^*, S_{wirr}^*, P_{ce}^*, \\beta^*$). Memberikan minimasi residual RMSE global terendah.")
+
+        else:  # Hybrid
+            st.write("🔧 **Pengaturan Formulasi per Rock Type (Kustom / Hybrid)**:")
+            st.caption("Sesuaikan formulasi untuk masing-masing tipe batuan. Contoh petrofisika: Gunakan **Stage 1** untuk Rock Type dengan head kapiler rendah atau asimtot yang perlu dipertahankan (seperti RT-4), dan **Stage 2/3** untuk Rock Type lainnya (RT-1, RT-2, RT-3).")
+            
+            h_cols = st.columns(min(len(active_rts), 4))
+            for i, r in enumerate(active_rts):
+                col = h_cols[i % len(h_cols)]
+                with col:
+                    choice = st.radio(
+                        f"Formulasi RT-{r}:",
+                        ["⚡ Stage 1 (Multiplier)", "🎯 Stage 2/3 (Multi-Param)"],
+                        key=f"hybrid_choice_{r}",
+                        index=0 if r == 4 else 1  # Default RT-4 to Stage 1
+                    )
+                    if "Stage 1" in choice:
+                        selected_export_params[r] = stg1_params.get(r, 1.0)
+                        stage_descriptions[r] = "Stage 1 (Multiplier-Only)"
+                    else:
+                        selected_export_params[r] = stg2_params.get(r, {'alpha': 1.0, 'swirr': sm.tables[r].base_swirr, 'pce': 0.0, 'beta': 1.0})
+                        stage_descriptions[r] = "Stage 2/3 (Multi-Parameter)"
+
+            active_zip_name = "Optimized_SCAL_Decks_Hybrid.zip"
+
+            # Generate Hybrid ZIP
+            sm.apply_multipliers_dict(selected_export_params)
+            zip_buf_hybrid = io.BytesIO()
+            with zipfile.ZipFile(zip_buf_hybrid, "w", zipfile.ZIP_DEFLATED) as zf_h:
+                for r_id in active_rts:
+                    c_h = sm.export_scal_string(r_id, stage_label=stage_descriptions[r_id])
+                    zf_h.writestr(f"RT-{r_id}_opt.GRDECL", c_h)
+
+            st.download_button(
+                label="📦 Download Selected Hybrid Decks (.ZIP)",
+                data=zip_buf_hybrid.getvalue(),
+                file_name=active_zip_name,
+                mime="application/zip",
+                type="primary",
+                use_container_width=True
+            )
+
+        # Apply the chosen formulation to scal manager for preview
+        sm.apply_multipliers_dict(selected_export_params)
 
         st.write("---")
         st.subheader("Individual Rock Type Decks & Code Preview")
 
-        rt_tabs = st.tabs([f"RT-{r}" for r in sorted(sm.tables.keys())])
-        for idx, r_id in enumerate(sorted(sm.tables.keys())):
+        rt_tabs = st.tabs([f"RT-{r} [{stage_descriptions[r].split()[0]}]" for r in active_rts])
+        for idx, r_id in enumerate(active_rts):
             with rt_tabs[idx]:
-                content = sm.export_scal_string(r_id)
-                st.download_button(
-                    label=f"⬇️ Download RT-{r_id}_opt.GRDECL",
-                    data=content,
-                    file_name=f"RT-{r_id}_opt.GRDECL",
-                    mime="text/plain"
-                )
+                tbl = sm.tables[r_id]
+                current_formulation = stage_descriptions[r_id]
+                content = sm.export_scal_string(r_id, stage_label=current_formulation)
+
+                # Parameter summary card
+                m1, m2, m3, m4 = st.columns(4)
+                with m1:
+                    st.metric("Formulasi", current_formulation)
+                with m2:
+                    st.metric("Alpha (Multiplier)", f"{tbl.current_multiplier:.4f}")
+                with m3:
+                    st.metric("Sw_irr (Endpoint)", f"{tbl.current_swirr:.4f}")
+                with m4:
+                    st.metric(f"Pce [{p_unit}] / Beta", f"{tbl.current_pce:.2f} {p_unit} / {tbl.current_beta:.2f}")
+
+                # Download buttons for this rock type
+                b_col1, b_col2 = st.columns([1, 1])
+                with b_col1:
+                    st.download_button(
+                        label=f"⬇️ Download RT-{r_id}_opt.GRDECL ({current_formulation})",
+                        data=content,
+                        file_name=f"RT-{r_id}_opt.GRDECL",
+                        mime="text/plain",
+                        key=f"dl_opt_{r_id}"
+                    )
+                with b_col2:
+                    # Provide direct Stage 1 download if currently looking at Stage 2 or vice versa
+                    alt_label = "Stage 1" if "Stage 2" in current_formulation else "Stage 2/3"
+                    alt_param = stg1_params.get(r_id, 1.0) if "Stage 2" in current_formulation else stg2_params.get(r_id, {'alpha': 1.0, 'swirr': tbl.base_swirr, 'pce': 0.0, 'beta': 1.0})
+                    
+                    # Temporarily compute alt content
+                    sm.apply_multipliers_dict({r_id: alt_param})
+                    alt_content = sm.export_scal_string(r_id, stage_label=f"Alternative: {alt_label}")
+                    sm.apply_multipliers_dict(selected_export_params)  # restore
+                    
+                    st.download_button(
+                        label=f"⬇️ Download RT-{r_id}_{alt_label.replace('/', '_')}.GRDECL",
+                        data=alt_content,
+                        file_name=f"RT-{r_id}_{alt_label.replace('/', '_')}.GRDECL",
+                        mime="text/plain",
+                        key=f"dl_alt_{r_id}"
+                    )
+
                 st.code(content, language="text")
 
         st.write("---")
-        st.markdown("""
+        st.markdown(r"""
         ### Instructions for Manual Execution in tNavigator:
-        1. **Update PROPS Section**: Replace or include the downloaded `RT-*.GRDECL` files in your `.DATA` deck:
+        1. **Update PROPS Section**: Masukkan file `RT-*_opt.GRDECL` hasil unduhan ke dalam deck simulasi `.DATA`:
            ```text
            PROPS
            INCLUDE 'RT-1_opt.GRDECL' /
            INCLUDE 'RT-2_opt.GRDECL' /
            INCLUDE 'RT-3_opt.GRDECL' /
-           INCLUDE 'RT-4.GRDECL' /
+           INCLUDE 'RT-4_opt.GRDECL' /
            ```
-        2. **Run Initialization**: Execute Step 0 (Equilibration / `EQUIL`) in tNavigator.
-        3. **Export Dynamic Sw**: In the 3D results viewer, select property `SWAT` at step 0 $\to$ Export Property to verify the spatial match!
+        2. **Run Initialization**: Jalankan Step 0 (Equilibration / `EQUIL`) di tNavigator.
+        3. **Export Dynamic Sw**: Pada viewer 3D tNavigator, pilih properti `SWAT` pada timestep 0 $\to$ Export Property untuk verifikasi kecocokan saturasi 3D.
         """)
