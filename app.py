@@ -359,6 +359,25 @@ opt_stage = st.sidebar.selectbox(
     ]
 )
 
+opt_algorithm = st.sidebar.selectbox(
+    "Optimization Algorithm:",
+    [
+        "🧬 Differential Evolution (Global Metaheuristic) [Recommended - Best Match]",
+        "🔥 Dual Annealing (Global Simulated Annealing)",
+        "⚡ L-BFGS-B (Local Gradient-Based) [Fast < 1 s]"
+    ],
+    help="Differential Evolution mencari solusi optimal global di seluruh ruang parameter tanpa terjebak di local minima, mencegah keruntuhan kurva SCAL. L-BFGS-B lebih cepat (< 1 detik) namun rentan terjebak di lembah lokal."
+)
+
+asymp_guard = st.sidebar.radio(
+    "Petrophysical Asymptotic Guard:",
+    [
+        "🛡️ Active (Anchor Swirr within ±20% of SCAL Lab & Preserve Asymptote) [Recommended]",
+        "⚠️ Disabled (Full Unconstrained Search)"
+    ],
+    help="Pelindung Petrofisika: Mengunci Swirr dalam koridor ±20% dari pengukuran core laboratorium dan menjamin faktor pengali alpha mempertahankan lonjakan vertikal asimtot SCAL asli (mencegah fenomena Asymptotic Collapse seperti pada RT-4)."
+)
+
 bounds_mode = st.sidebar.radio(
     "Parameter Bounds Mode:",
     [
@@ -722,12 +741,24 @@ with tabs[1]:
                     use_pce = "Endpoints" in opt_stage or use_curv
                     eff_pce_max = 30.0 if gd.get('unit_system') == 'FIELD' else 2.0
 
+                    # Parse solver algorithm choice
+                    if "Differential" in opt_algorithm:
+                        algo_choice = "differential_evolution"
+                    elif "Annealing" in opt_algorithm:
+                        algo_choice = "dual_annealing"
+                    else:
+                        algo_choice = "L-BFGS-B"
+
+                    use_guard = asymp_guard.startswith("🛡️")
+
                     res_stage2 = optimizer.optimize_endpoints(
                         alpha_bounds=(0.01, eff_alpha_max),
                         pce_bounds=(0.0, eff_pce_max),
                         beta_bounds=(0.2, eff_beta_max),
                         optimize_entry_pressure=use_pce,
-                        optimize_curvature=use_curv
+                        optimize_curvature=use_curv,
+                        algorithm=algo_choice,
+                        asymptotic_guard=use_guard
                     )
 
                     # Generate dynamic Sw across all active cells
@@ -753,7 +784,9 @@ with tabs[1]:
                         'solve_time': time.time() - t_start,
                         'eff_alpha_max': eff_alpha_max,
                         'eff_beta_max': eff_beta_max,
-                        'bounds_mode': bounds_mode
+                        'bounds_mode': bounds_mode,
+                        'algorithm': algo_choice,
+                        'asymptotic_guard': use_guard
                     }
                     st.success(f"Optimization converged in {st.session_state['opt_results']['solve_time']:.2f} seconds!")
 
@@ -763,8 +796,14 @@ with tabs[1]:
                 m_init = res['init_metrics']
                 m_opt = res['stg2_metrics']
 
+                if res.get('asymptotic_guard'):
+                    st.success(r"🛡️ **Petrophysical Asymptotic Guard Active**: Seluruh kurva SCAL diikat ke nilai inti batuan laboratorium ($S_{wirr} \pm 20\%$ & $\alpha \ge 0.80$). Dinding asimtot vertikal terproteksi penuh dari fenomena *Asymptotic Collapse*.")
+
+                algo_name = "🧬 Differential Evolution (Global)" if res.get('algorithm') == 'differential_evolution' else ("🔥 Dual Annealing (Global)" if res.get('algorithm') == 'dual_annealing' else "⚡ L-BFGS-B (Local)")
+                st.info(f"⚙️ **Optimization Engine**: `{algo_name}` | Bounds Mode: `{res.get('bounds_mode', 'Auto')}` | Solved across {len(res['stage2']['per_rock_type'])} Rock Types in {res.get('solve_time', 0):.2f} seconds.")
+
                 if res.get('bounds_mode', '').startswith("🤖"):
-                    st.info(f"🤖 **Auto-Recommended Formulation Applied**: Batas optimasi adaptif otomatis diatur ke Alpha ∈ [0.01, {res.get('eff_alpha_max', 25.0):.1f}] dan Beta ∈ [0.20, {res.get('eff_beta_max', 5.0):.1f}] untuk memastikan konvergensi global dan residual error minimum.")
+                    st.caption(f"🤖 **Auto-Recommended Formulation Applied**: Batas optimasi adaptif otomatis diatur ke Alpha ∈ [0.01, {res.get('eff_alpha_max', 25.0):.1f}] dan Beta ∈ [0.20, {res.get('eff_beta_max', 5.0):.1f}] untuk memastikan konvergensi global dan residual error minimum.")
 
                 err_red = (1.0 - m_opt['global_rmse'] / m_init['global_rmse']) * 100.0 if m_init['global_rmse'] > 0 else 0.0
 
