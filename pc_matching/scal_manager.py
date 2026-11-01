@@ -251,7 +251,8 @@ class SCALManager:
         self,
         rt_id: int,
         output_filename: Optional[str] = None,
-        backup_original: bool = True
+        backup_original: bool = True,
+        stage_label: Optional[str] = None
     ) -> str:
         """
         Export modified SCAL table into a simulation-ready ECLIPSE/tNavigator GRDECL file.
@@ -273,6 +274,8 @@ class SCALManager:
 
         with open(out_path, 'w') as f:
             f.write("SWOF                                   -- Generated : Pc-Matching Optimizer\n")
+            if stage_label:
+                f.write(f"-- Optimization Formulation : {stage_label}\n")
             f.write(f"-- Modified with Multiplier alpha={table.current_multiplier:.4f}, "
                     f"Sw_irr={table.current_swirr:.4f}, Pce={table.current_pce:.4f}, Beta={table.current_beta:.4f}\n")
             for _, row in table.swof_df.iterrows():
@@ -290,7 +293,7 @@ class SCALManager:
 
         return out_path
 
-    def export_scal_string(self, rt_id: int) -> str:
+    def export_scal_string(self, rt_id: int, stage_label: Optional[str] = None) -> str:
         """
         Export modified SCAL table as a formatted GRDECL string.
         """
@@ -300,6 +303,8 @@ class SCALManager:
         table = self.tables[rt_id]
         lines = []
         lines.append("SWOF                                   -- Generated : Pc-Matching Optimizer\n")
+        if stage_label:
+            lines.append(f"-- Optimization Formulation : {stage_label}\n")
         lines.append(f"-- Modified with Multiplier alpha={table.current_multiplier:.4f}, "
                      f"Sw_irr={table.current_swirr:.4f}, Pce={table.current_pce:.4f}, Beta={table.current_beta:.4f}\n")
         for _, row in table.swof_df.iterrows():
