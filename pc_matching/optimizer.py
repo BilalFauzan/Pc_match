@@ -13,7 +13,7 @@ Strictly without any hydrocarbon volume / STOIIP dependencies.
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Optional, Tuple, Callable, Any
-from scipy.optimize import minimize_scalar, minimize
+from scipy.optimize import minimize_scalar, minimize, differential_evolution, dual_annealing
 from .equilibrator import ReservoirEquilibrator
 
 
@@ -201,7 +201,11 @@ class PcOptimizer:
         pce_bounds: Tuple[float, float] = (0.0, 2.0),
         beta_bounds: Tuple[float, float] = (0.1, 5.0),
         optimize_entry_pressure: bool = True,
-        optimize_curvature: bool = True
+        optimize_curvature: bool = True,
+        algorithm: str = "differential_evolution",
+        asymptotic_guard: bool = True,
+        swirr_tolerance: float = 0.20,
+        min_alpha_guard: float = 0.80
     ) -> Dict[str, Any]:
         """
         Stage 2 & 3: Joint Multiplier, Endpoint, and Curvature Shape Optimization.
@@ -211,8 +215,14 @@ class PcOptimizer:
         3. Entry / displacement pressure endpoint: Pce,r
         4. Curvature / pore-size distribution shape exponent: beta_r (Option A)
         
-        This allows the dynamic model to adapt both to the height transition zone
-        and the asymptotic irreducible saturation floor of the geological model.
+        Features:
+        - algorithm: 'differential_evolution' (Global genetic metaheuristic with L-BFGS-B polish),
+                     'dual_annealing' (Global simulated annealing), or
+                     'L-BFGS-B' (Fast gradient-based local solver).
+        - asymptotic_guard: Anchors Sw_irr within +-swirr_tolerance (default +-20%) of the core
+                            lab measurement and enforces alpha >= min_alpha_guard to guarantee
+                            that the steep physical asymptotic rise is preserved, completely
+                            preventing unphysical Asymptotic Collapse (e.g. on RT-4).
         """
         optimal_params = {}
         rt_results = {}
@@ -233,15 +243,25 @@ class PcOptimizer:
             base_pc = table.base_pcow
             s_wn = np.clip((base_sw - base_swirr) / (1.0 - base_swirr), 0.0, 1.0)
 
-            target_min = float(np.min(target_sw))
-            target_mean = float(np.mean(target_sw))
-            swirr_min = max(0.001, target_min * 0.5)
-            swirr_max = min(0.95, max(target_mean, base_swirr))
+            # Determine petrophysical parameter bounds
+            if asymptotic_guard:
+                # Petrophysical anchoring: keep Swirr strictly within +- swirr_tolerance of core lab measurement
+                swirr_min = max(0.01, float(base_swirr * (1.0 - swirr_tolerance)))
+                swirr_max = min(0.98, float(base_swirr * (1.0 + swirr_tolerance)))
+                # Guard alpha to ensure vertical asymptotic rise isn't destroyed
+                eff_alpha_min = max(min_alpha_guard, alpha_bounds[0])
+                eff_alpha_bounds = (eff_alpha_min, max(eff_alpha_min * 2.0, alpha_bounds[1]))
+            else:
+                target_min = float(np.min(target_sw))
+                target_mean = float(np.mean(target_sw))
+                swirr_min = max(0.001, target_min * 0.5)
+                swirr_max = min(0.95, max(target_mean, base_swirr))
+                eff_alpha_bounds = alpha_bounds
 
             if optimize_curvature:
                 # 4 parameters: [alpha, swirr, pce, beta]
-                x0 = [1.0, base_swirr, 0.0, 1.0]
-                bnds = [alpha_bounds, (swirr_min, swirr_max), pce_bounds, beta_bounds]
+                x0 = [max(1.0, eff_alpha_bounds[0]), base_swirr, 0.0, 1.0]
+                bnds = [eff_alpha_bounds, (swirr_min, swirr_max), pce_bounds, beta_bounds]
 
                 def obj_joint(p):
                     a_val, sw_val, pce_val, beta_val = p
@@ -254,12 +274,17 @@ class PcOptimizer:
                         if sc_pc[i] < sc_pc[i + 1]:
                             sc_pc[i] = sc_pc[i + 1]
                     sw_est = np.interp(pc_h, sc_pc[::-1], new_sw[::-1], left=1.0, right=new_sw[0])
-                    return float(np.sqrt(np.mean((sw_est - target_sw) ** 2)))
+                    rmse_val = float(np.sqrt(np.mean((sw_est - target_sw) ** 2)))
+                    if asymptotic_guard:
+                        pen_sw = 0.25 * ((sw_val - base_swirr) / base_swirr) ** 2
+                        pen_a = 0.25 * (max(0.0, 1.0 - a_val)) ** 2
+                        return rmse_val + pen_sw + pen_a
+                    return rmse_val
 
             elif optimize_entry_pressure:
                 # 3 parameters: [alpha, swirr, pce]
-                x0 = [1.0, base_swirr, 0.0]
-                bnds = [alpha_bounds, (swirr_min, swirr_max), pce_bounds]
+                x0 = [max(1.0, eff_alpha_bounds[0]), base_swirr, 0.0]
+                bnds = [eff_alpha_bounds, (swirr_min, swirr_max), pce_bounds]
 
                 def obj_joint(p):
                     a_val, sw_val, pce_val = p
@@ -271,11 +296,16 @@ class PcOptimizer:
                         if sc_pc[i] < sc_pc[i + 1]:
                             sc_pc[i] = sc_pc[i + 1]
                     sw_est = np.interp(pc_h, sc_pc[::-1], new_sw[::-1], left=1.0, right=new_sw[0])
-                    return float(np.sqrt(np.mean((sw_est - target_sw) ** 2)))
+                    rmse_val = float(np.sqrt(np.mean((sw_est - target_sw) ** 2)))
+                    if asymptotic_guard:
+                        pen_sw = 0.25 * ((sw_val - base_swirr) / base_swirr) ** 2
+                        pen_a = 0.25 * (max(0.0, 1.0 - a_val)) ** 2
+                        return rmse_val + pen_sw + pen_a
+                    return rmse_val
             else:
                 # 2 parameters: [alpha, swirr]
-                x0 = [1.0, base_swirr]
-                bnds = [alpha_bounds, (swirr_min, swirr_max)]
+                x0 = [max(1.0, eff_alpha_bounds[0]), base_swirr]
+                bnds = [eff_alpha_bounds, (swirr_min, swirr_max)]
 
                 def obj_joint(p):
                     a_val, sw_val = p
@@ -287,10 +317,36 @@ class PcOptimizer:
                         if sc_pc[i] < sc_pc[i + 1]:
                             sc_pc[i] = sc_pc[i + 1]
                     sw_est = np.interp(pc_h, sc_pc[::-1], new_sw[::-1], left=1.0, right=new_sw[0])
-                    return float(np.sqrt(np.mean((sw_est - target_sw) ** 2)))
+                    rmse_val = float(np.sqrt(np.mean((sw_est - target_sw) ** 2)))
+                    if asymptotic_guard:
+                        pen_sw = 0.25 * ((sw_val - base_swirr) / base_swirr) ** 2
+                        pen_a = 0.25 * (max(0.0, 1.0 - a_val)) ** 2
+                        return rmse_val + pen_sw + pen_a
+                    return rmse_val
 
             init_rmse = obj_joint(x0)
-            res = minimize(obj_joint, x0, bounds=bnds, method='L-BFGS-B')
+            algo_key = algorithm.lower().replace("-", "").replace("_", "")
+
+            if "differential" in algo_key or "evolution" in algo_key or algo_key == "de":
+                res = differential_evolution(
+                    obj_joint,
+                    bounds=bnds,
+                    seed=42,
+                    maxiter=40,
+                    popsize=12,
+                    mutation=(0.5, 1.0),
+                    recombination=0.7,
+                    polish=True
+                )
+            elif "dual" in algo_key or "annealing" in algo_key:
+                res = dual_annealing(
+                    obj_joint,
+                    bounds=bnds,
+                    seed=42,
+                    maxiter=120
+                )
+            else:  # L-BFGS-B or local default
+                res = minimize(obj_joint, x0, bounds=bnds, method='L-BFGS-B')
 
             if optimize_curvature:
                 opt_a, opt_sw, opt_pce, opt_beta = res.x
@@ -301,6 +357,18 @@ class PcOptimizer:
                 opt_a, opt_sw = res.x
                 opt_pce = 0.0
                 opt_beta = 1.0
+
+            # Pure unregularized RMSE evaluation for clean petrophysical reporting
+            s_wn_curv = s_wn ** opt_beta
+            new_sw_eval = opt_sw + s_wn_curv * (1.0 - opt_sw)
+            sc_pc_eval = opt_pce * (1.0 - s_wn_curv) + base_pc * opt_a
+            sc_pc_eval[-1] = 0.0
+            sc_pc_eval = np.maximum(0.0, sc_pc_eval)
+            for i in range(len(sc_pc_eval) - 2, -1, -1):
+                if sc_pc_eval[i] < sc_pc_eval[i + 1]:
+                    sc_pc_eval[i] = sc_pc_eval[i + 1]
+            sw_est_opt = np.interp(pc_h, sc_pc_eval[::-1], new_sw_eval[::-1], left=1.0, right=new_sw_eval[0])
+            pure_opt_rmse = float(np.sqrt(np.mean((sw_est_opt - target_sw) ** 2)))
 
             optimal_params[rt] = {
                 'alpha': float(opt_a),
@@ -316,9 +384,11 @@ class PcOptimizer:
                 'optimal_pce': float(opt_pce),
                 'optimal_beta': float(opt_beta),
                 'initial_rmse': init_rmse,
-                'optimal_rmse': float(res.fun),
-                'rmse_reduction_pct': (1.0 - float(res.fun) / init_rmse) * 100.0 if init_rmse > 0 else 0.0,
-                'iterations': res.nfev
+                'optimal_rmse': pure_opt_rmse,
+                'rmse_reduction_pct': (1.0 - pure_opt_rmse / init_rmse) * 100.0 if init_rmse > 0 else 0.0,
+                'iterations': getattr(res, 'nfev', 0),
+                'algorithm': algorithm,
+                'asymptotic_guard': asymptotic_guard
             }
 
         sw_dyn_init = self.equilibrator.calculate_dynamic_sw(
@@ -337,5 +407,7 @@ class PcOptimizer:
             'initial_metrics': init_metrics,
             'optimal_metrics': opt_metrics,
             'sw_dynamic_initial': sw_dyn_init,
-            'sw_dynamic_optimal': sw_dyn_opt
+            'sw_dynamic_optimal': sw_dyn_opt,
+            'algorithm': algorithm,
+            'asymptotic_guard': asymptotic_guard
         }
