@@ -310,9 +310,19 @@ else:
 
 
 # -----------------------------------------------------------------------------
-# 3. SOLUTION & FLUID DECKS (OPTIONAL)
+# 3. FLUID DECKS & UNIT CONVENTION (OPTIONAL)
 # -----------------------------------------------------------------------------
-st.sidebar.subheader("3. Solution & Fluid Decks (Optional)")
+st.sidebar.subheader("3. Fluid Decks & Unit Convention")
+unit_mode = st.sidebar.selectbox(
+    "Unit System Convention:",
+    [
+        "🤖 Auto-Detect (Berdasarkan File & Densitas)",
+        "🌐 METRIC (Depth: m, Pc: bar, Density: kg/m³)",
+        "🇺🇸 FIELD (Depth: ft, Pc: psi, Density: lb/ft³)"
+    ],
+    help="Sistem satuan yang digunakan model. Auto-Detect akan otomatis mendeteksi apakah model menggunakan satuan METRIC atau FIELD berdasarkan keyword FILEUNIT di SCAL dan rentang nilai DENSITY fluida."
+)
+
 uploaded_sol = st.sidebar.file_uploader(
     "Upload Solution / EQUIL (.INC / .DATA)",
     type=["inc", "data", "txt"],
@@ -512,6 +522,29 @@ with tabs[0]:
                 rho_w = density_records[0]['water_density'] if density_records else 1013.2
                 rho_o = density_records[1]['oil_density'] if len(density_records) > 1 else (density_records[0]['oil_density'] if density_records else 820.91)
 
+                # Auto-detect or user-selected unit system
+                detected_unit = "METRIC"
+                if "METRIC" in unit_mode:
+                    detected_unit = "METRIC"
+                elif "FIELD" in unit_mode:
+                    detected_unit = "FIELD"
+                else:  # Auto-detect
+                    scal_units = [tbl.fileunit.upper() for tbl in scal_mgr.tables.values()] if scal_mgr.tables else []
+                    if "FIELD" in scal_units:
+                        detected_unit = "FIELD"
+                    elif rho_w < 200.0:  # Field water density is ~62-65 lb/ft^3; METRIC is ~1000 kg/m^3
+                        detected_unit = "FIELD"
+                    else:
+                        detected_unit = "METRIC"
+
+                p_unit = "psi" if detected_unit == "FIELD" else "bar"
+                d_unit = "ft" if detected_unit == "FIELD" else "m"
+                rho_unit = "lb/ft³" if detected_unit == "FIELD" else "kg/m³"
+
+                # Sync table fileunit with detected unit system for export
+                for tbl in scal_mgr.tables.values():
+                    tbl.fileunit = detected_unit
+
                 if equil_records:
                     for eq in equil_records:
                         r_id = eq['region']
@@ -520,16 +553,18 @@ with tabs[0]:
                             datum_depth=float(eq['datum_depth']),
                             datum_pressure=float(eq['datum_pressure']),
                             water_density=float(rho_w),
-                            oil_density=float(rho_o)
+                            oil_density=float(rho_o),
+                            unit_system=detected_unit
                         )
                 else:
                     # Single default equilibration datum
                     multi_params[1] = pcm.EquilibrationParams(
                         fwl_depth=float(np.max(depth_grid[active_mask])),
                         datum_depth=float(np.mean(depth_grid[active_mask])),
-                        datum_pressure=100.0,
+                        datum_pressure=100.0 if detected_unit == "METRIC" else 1450.0,
                         water_density=float(rho_w),
-                        oil_density=float(rho_o)
+                        oil_density=float(rho_o),
+                        unit_system=detected_unit
                     )
 
                 equilibrator = pcm.ReservoirEquilibrator(scal_mgr, multi_params=multi_params)
@@ -545,7 +580,11 @@ with tabs[0]:
                     'eqlnum_active': eqlnum_grid[active_mask] if eqlnum_grid is not None else np.ones(np.sum(active_mask), dtype=int),
                     'density_records': density_records,
                     'equil_records': equil_records,
-                    'multi_params': multi_params
+                    'multi_params': multi_params,
+                    'unit_system': detected_unit,
+                    'p_unit': p_unit,
+                    'd_unit': d_unit,
+                    'rho_unit': rho_unit
                 }
                 st.session_state['scal_manager'] = scal_mgr
                 st.session_state['equilibrator'] = equilibrator
@@ -589,7 +628,9 @@ with tabs[0]:
             st.write("---")
 
             # Active rock types summary table
-            st.subheader("Rock Type Pay Zone Distribution")
+            p_unit = gd.get('p_unit', 'bar')
+            d_unit = gd.get('d_unit', 'm')
+            st.subheader(f"Rock Type Pay Zone Distribution (Unit System: {gd.get('unit_system', 'METRIC')})")
             rt_summary = []
             for r in np.unique(gd['rt_active']):
                 m = (gd['rt_active'] == r)
@@ -597,7 +638,7 @@ with tabs[0]:
                     "Rock Type": f"RT-{r}",
                     "Active Cells": f"{np.sum(m):,}",
                     "Pay Fraction": f"{np.sum(m)/len(gd['rt_active'])*100:.2f}%",
-                    "Mean TVD": f"{gd['depth_active'][m].mean():.1f} m",
+                    "Mean TVD": f"{gd['depth_active'][m].mean():.1f} {d_unit}",
                     "Mean Porosity": f"{gd['poro_active'][m].mean():.3f}",
                     "Mean Static Sw": f"{gd['sw_static_active'][m].mean():.3f}",
                     "SCAL Base Sw_irr": f"{sm.tables[r].base_swirr:.3f}" if r in sm.tables else "-"
@@ -612,8 +653,8 @@ with tabs[0]:
                     m = (gd['eqlnum_active'] == r_id)
                     eq_rows.append({
                         "Region": f"EQLNUM {r_id}",
-                        "WOC / FWL Depth [m TVD]": f"{p.fwl_depth:.2f}",
-                        "Capillary Gradient [bar/m]": f"{p.capillary_gradient:.6f}",
+                        f"WOC / FWL Depth [{d_unit} TVD]": f"{p.fwl_depth:.2f}",
+                        f"Capillary Gradient [{p_unit}/{d_unit}]": f"{p.capillary_gradient:.6f}",
                         "Active Cells": f"{np.sum(m):,}",
                         "Mean Sw Static": f"{gd['sw_static_active'][m].mean():.3f}" if np.any(m) else "-"
                     })
@@ -679,10 +720,11 @@ with tabs[1]:
                     # Stage 2 / 3: Multiplier + Endpoints + Curvature
                     use_curv = "Curvature (Beta)" in opt_stage
                     use_pce = "Endpoints" in opt_stage or use_curv
+                    eff_pce_max = 30.0 if gd.get('unit_system') == 'FIELD' else 2.0
 
                     res_stage2 = optimizer.optimize_endpoints(
                         alpha_bounds=(0.01, eff_alpha_max),
-                        pce_bounds=(0.0, 2.0),
+                        pce_bounds=(0.0, eff_pce_max),
                         beta_bounds=(0.2, eff_beta_max),
                         optimize_entry_pressure=use_pce,
                         optimize_curvature=use_curv
@@ -740,6 +782,7 @@ with tabs[1]:
                 st.subheader("Rock Type Optimal Parameter Breakdown")
                 
                 table_records = []
+                p_unit = gd.get('p_unit', 'bar')
                 for r in sorted(res['stage2']['per_rock_type'].keys()):
                     info1 = res['stage1']['per_rock_type'][r]
                     info2 = res['stage2']['per_rock_type'][r]
@@ -750,7 +793,7 @@ with tabs[1]:
                         "Optimal Sw_irr": f"{info2['optimal_swirr']:.4f}",
                         "Stage 1 Alpha*": f"{info1['optimal_multiplier']:.3f}",
                         "Optimal Alpha*": f"{info2['optimal_alpha']:.3f}",
-                        "Optimal Pce [bar]": f"{info2['optimal_pce']:.4f}",
+                        f"Optimal Pce [{p_unit}]": f"{info2['optimal_pce']:.4f}",
                         "Optimal Beta": f"{info2['optimal_beta']:.4f}",
                         "Baseline RMSE": f"{info1['initial_rmse']:.4f}",
                         "Optimized RMSE": f"{info2['optimal_rmse']:.4f}",
@@ -815,7 +858,7 @@ with tabs[2]:
                 fig.add_trace(go.Scatter(x=sw_pts, y=pc_pts, mode='lines+markers', name=lbl, line=dict(color='red', width=3)), row=1, col=idx)
 
                 fig.update_xaxes(title_text="Water Saturation Sw [frac]", range=[0, 1.05], row=1, col=idx)
-                fig.update_yaxes(title_text="Capillary Pressure Pcow [bar]" if idx == 1 else None, row=1, col=idx)
+                fig.update_yaxes(title_text=f"Capillary Pressure Pcow [{gd.get('p_unit', 'bar')}]" if idx == 1 else None, row=1, col=idx)
 
             fig.update_layout(height=480, template="plotly_white", showlegend=True)
             st.plotly_chart(fig, use_container_width=True)
@@ -840,7 +883,7 @@ with tabs[2]:
                 fig.add_trace(go.Scatter(x=sw_dyn_s[m_r], y=d_s[m_r], mode='markers', name=f'Optimized Dynamic RT-{r}', marker=dict(size=4, color='red', opacity=0.55)), row=1, col=col_idx)
                 fig.update_xaxes(title_text="Water Saturation Sw", range=[0, 1.05], row=1, col=col_idx)
                 if col_idx == 1:
-                    fig.update_yaxes(title_text="Depth TVD [m]", autorange="reversed", row=1, col=col_idx)
+                    fig.update_yaxes(title_text=f"Depth TVD [{gd.get('d_unit', 'm')}]", autorange="reversed", row=1, col=col_idx)
                 else:
                     fig.update_yaxes(autorange="reversed", row=1, col=col_idx)
 
