@@ -15,14 +15,16 @@ from .scal_manager import SCALManager
 class EquilibrationParams:
     """
     Equilibration and fluid parameters matching ECLIPSE / tNavigator EQUIL keyword.
+    Supports both METRIC (m, bar, kg/m^3) and FIELD (ft, psi, lb/ft^3) units.
     """
     def __init__(
         self,
-        fwl_depth: float = 925.0,        # Free Water Level / WOC TVD [m]
-        datum_depth: float = 700.0,      # Datum depth [m]
-        datum_pressure: float = 100.0,   # Datum pressure [bar]
-        water_density: float = 1020.0,   # Brine density [kg/m^3]
-        oil_density: float = 820.0,      # Reservoir oil density [kg/m^3]
+        fwl_depth: float = 925.0,        # Free Water Level / WOC TVD [m or ft]
+        datum_depth: float = 700.0,      # Datum depth [m or ft]
+        datum_pressure: float = 100.0,   # Datum pressure [bar or psi]
+        water_density: float = 1020.0,   # Brine density [kg/m^3 or lb/ft^3]
+        oil_density: float = 820.0,      # Reservoir oil density [kg/m^3 or lb/ft^3]
+        unit_system: str = "METRIC",      # Unit convention: 'METRIC' or 'FIELD'
         g: float = 9.80665               # Acceleration of gravity [m/s^2]
     ):
         self.fwl_depth = fwl_depth
@@ -30,17 +32,37 @@ class EquilibrationParams:
         self.datum_pressure = datum_pressure
         self.water_density = water_density
         self.oil_density = oil_density
+        self.unit_system = unit_system.upper().strip()
         self.g = g
 
     @property
     def density_difference(self) -> float:
-        """Delta rho in kg/m^3."""
+        """Delta rho in kg/m^3 or lb/ft^3."""
         return max(0.0, self.water_density - self.oil_density)
 
     @property
     def capillary_gradient(self) -> float:
-        """Capillary pressure gradient in bar/meter: (rho_w - rho_o) * g * 1e-5."""
-        return self.density_difference * self.g * 1e-5
+        """
+        Capillary pressure gradient:
+        - METRIC: (rho_w - rho_o) [kg/m^3] * g * 1e-5  --> [bar/m]
+        - FIELD:  (rho_w - rho_o) [lb/ft^3] / 144      --> [psi/ft]
+        """
+        if self.unit_system == "FIELD":
+            return self.density_difference / 144.0
+        else:
+            return self.density_difference * self.g * 1e-5
+
+    @property
+    def pressure_unit(self) -> str:
+        return "psi" if self.unit_system == "FIELD" else "bar"
+
+    @property
+    def depth_unit(self) -> str:
+        return "ft" if self.unit_system == "FIELD" else "m"
+
+    @property
+    def density_unit(self) -> str:
+        return "lb/ft³" if self.unit_system == "FIELD" else "kg/m³"
 
     @classmethod
     def from_includes(
@@ -49,10 +71,12 @@ class EquilibrationParams:
         props_filepath: str,
         eql_region: int = 1,
         pvt_region: int = 1,
+        unit_system: Optional[str] = None,
         g: float = 9.80665
     ) -> 'EquilibrationParams':
         """
         Load equilibration and density parameters directly from ECLIPSE include files.
+        Auto-detects unit convention (METRIC vs FIELD) if not specified.
         """
         from .grdecl_io import FastGRDECLParser
         equil_list = FastGRDECLParser.parse_equil_keyword(sol_filepath)
@@ -62,6 +86,27 @@ class EquilibrationParams:
             raise ValueError(f"No EQUIL records found in {sol_filepath}")
         if not density_list:
             raise ValueError(f"No DENSITY records found in {props_filepath}")
+
+        eq_rec = equil_list[eql_region - 1] if eql_region <= len(equil_list) else equil_list[0]
+        dens_idx = (pvt_region - 1) if pvt_region <= len(density_list) else (1 if len(density_list) > 1 else 0)
+        dens_rec = density_list[dens_idx]
+
+        w_dens = float(dens_rec['water_density'])
+        o_dens = float(dens_rec['oil_density'])
+
+        # Auto-detect unit system from density value if not specified
+        if unit_system is None:
+            unit_system = "FIELD" if w_dens < 200.0 else "METRIC"
+
+        return cls(
+            fwl_depth=float(eq_rec['woc_depth']),
+            datum_depth=float(eq_rec['datum_depth']),
+            datum_pressure=float(eq_rec['datum_pressure']),
+            water_density=w_dens,
+            oil_density=o_dens,
+            unit_system=unit_system,
+            g=g
+        )
 
         eql_idx = min(max(1, eql_region), len(equil_list)) - 1
         pvt_idx = min(max(1, pvt_region), len(density_list)) - 1
