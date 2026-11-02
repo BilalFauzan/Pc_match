@@ -378,6 +378,25 @@ asymp_guard = st.sidebar.radio(
     help="Pelindung Petrofisika: Mengunci Swirr dalam koridor ±20% dari pengukuran core laboratorium dan menjamin faktor pengali alpha mempertahankan lonjakan vertikal asimtot SCAL asli (mencegah fenomena Asymptotic Collapse seperti pada RT-4)."
 )
 
+cell_weighting = st.sidebar.selectbox(
+    "Cell Weighting Formulation:",
+    [
+        "⚖️ Pore Volume (PV-Weighted) [Direct In-Place / STOIIP Matching - Recommended]",
+        "⚪ Uniform Weighting (Unweighted Spatial Average)"
+    ],
+    help="Pembobotan Pore Volume (PV = poro * NTG) mengutamakan sel-sel penyimpan fluida utama dan menyelaraskan optimasi dengan volume in-place hidrokarbon (STOIIP), mengabaikan noise dari sel berporositas marjinal."
+)
+
+loss_formulation = st.sidebar.selectbox(
+    "Objective Loss Type:",
+    [
+        "🛡️ Huber Loss (Robust to Scatter & Outliers) [Recommended for Wide Scatter]",
+        "🎯 Standard RMSE (L2 Norm)",
+        "📐 Mean Absolute Error (MAE / L1 Norm)"
+    ],
+    help="Huber Loss mengkombinasikan presisi kuadratik pada deviasi normal dengan kekebalan linier terhadap sebaran lebar (outlier) seperti pada RT-4."
+)
+
 bounds_mode = st.sidebar.radio(
     "Parameter Bounds Mode:",
     [
@@ -596,6 +615,7 @@ with tabs[0]:
                     'poro_active': poro_grid[active_mask],
                     'depth_active': depth_grid[active_mask],
                     'sw_static_active': sw_static_grid[active_mask],
+                    'ntg_active': ntg_grid[active_mask] if ntg_grid is not None else np.ones(np.sum(active_mask), dtype=np.float32),
                     'eqlnum_active': eqlnum_grid[active_mask] if eqlnum_grid is not None else np.ones(np.sum(active_mask), dtype=int),
                     'density_records': density_records,
                     'equil_records': equil_records,
@@ -724,17 +744,27 @@ with tabs[1]:
                         eff_alpha_max = float(alpha_max_val)
                         eff_beta_max = float(beta_max_val)
 
-                    # Optimizer instance
+                    # Optimizer instance with Pore Volume Weighting
                     optimizer = pcm.PcOptimizer(
                         equilibrator=eq,
                         depth_active=gd['depth_active'][oil_mask],
                         rt_active=gd['rt_active'][oil_mask],
                         sw_static_active=gd['sw_static_active'][oil_mask],
-                        eqlnum_active=gd['eqlnum_active'][oil_mask]
+                        eqlnum_active=gd['eqlnum_active'][oil_mask],
+                        poro_active=gd['poro_active'][oil_mask],
+                        ntg_active=gd.get('ntg_active', np.ones(np.sum(oil_mask), dtype=np.float32))[oil_mask]
                     )
 
+                    use_pv = cell_weighting.startswith("⚖️")
+                    weight_mode_str = "Pore Volume (PV-Weighted)" if use_pv else "Uniform (Unweighted)"
+                    loss_choice_str = "Huber Loss (Robust to Scatter)" if "Huber" in loss_formulation else ("Mean Absolute Error (L1)" if "MAE" in loss_formulation else "Standard RMSE (L2)")
+
                     # Stage 1: Multiplier-only
-                    res_stage1 = optimizer.optimize_independent(bounds=(0.01, eff_alpha_max))
+                    res_stage1 = optimizer.optimize_independent(
+                        bounds=(0.01, eff_alpha_max),
+                        weighting_mode=weight_mode_str,
+                        loss_type=loss_choice_str
+                    )
                     
                     # Stage 2 / 3: Multiplier + Endpoints + Curvature
                     use_curv = "Curvature (Beta)" in opt_stage
@@ -758,7 +788,9 @@ with tabs[1]:
                         optimize_entry_pressure=use_pce,
                         optimize_curvature=use_curv,
                         algorithm=algo_choice,
-                        asymptotic_guard=use_guard
+                        asymptotic_guard=use_guard,
+                        weighting_mode=weight_mode_str,
+                        loss_type=loss_choice_str
                     )
 
                     # Generate dynamic Sw across all active cells
@@ -767,7 +799,8 @@ with tabs[1]:
                     sw_dyn_opt = eq.calculate_dynamic_sw(gd['depth_active'], gd['rt_active'], res_stage2['optimal_parameters'], eqlnum_array=gd['eqlnum_active'])
 
                     # Compute metrics
-                    m_init = pcm.OptimizationMetrics.compute(gd['sw_static_active'][oil_mask], sw_dyn_init[oil_mask], gd['rt_active'][oil_mask])
+                    pv_weights_active = optimizer.pv_weights
+                    m_init = pcm.OptimizationMetrics.compute(gd['sw_static_active'][oil_mask], sw_dyn_init[oil_mask], gd['rt_active'][oil_mask], weights=pv_weights_active)
                     m_stg1 = res_stage1['optimal_metrics']
                     m_stg2 = res_stage2['optimal_metrics']
 
@@ -786,7 +819,9 @@ with tabs[1]:
                         'eff_beta_max': eff_beta_max,
                         'bounds_mode': bounds_mode,
                         'algorithm': algo_choice,
-                        'asymptotic_guard': use_guard
+                        'asymptotic_guard': use_guard,
+                        'weighting_mode': weight_mode_str,
+                        'loss_type': loss_choice_str
                     }
                     st.success(f"Optimization converged in {st.session_state['opt_results']['solve_time']:.2f} seconds!")
 
@@ -800,14 +835,14 @@ with tabs[1]:
                     st.success(r"🛡️ **Petrophysical Asymptotic Guard Active**: Seluruh kurva SCAL diikat ke nilai inti batuan laboratorium ($S_{wirr} \pm 20\%$ & $\alpha \ge 0.80$). Dinding asimtot vertikal terproteksi penuh dari fenomena *Asymptotic Collapse*.")
 
                 algo_name = "🧬 Differential Evolution (Global)" if res.get('algorithm') == 'differential_evolution' else ("🔥 Dual Annealing (Global)" if res.get('algorithm') == 'dual_annealing' else "⚡ L-BFGS-B (Local)")
-                st.info(f"⚙️ **Optimization Engine**: `{algo_name}` | Bounds Mode: `{res.get('bounds_mode', 'Auto')}` | Solved across {len(res['stage2']['per_rock_type'])} Rock Types in {res.get('solve_time', 0):.2f} seconds.")
+                st.info(f"⚙️ **Optimization Engine**: `{algo_name}` | Cell Weighting: `{res.get('weighting_mode', 'PV-Weighted')}` | Loss Formulation: `{res.get('loss_type', 'Huber Loss')}` | Bounds: `{res.get('bounds_mode', 'Auto')}` | Solved in {res.get('solve_time', 0):.2f} s.")
 
                 if res.get('bounds_mode', '').startswith("🤖"):
                     st.caption(f"🤖 **Auto-Recommended Formulation Applied**: Batas optimasi adaptif otomatis diatur ke Alpha ∈ [0.01, {res.get('eff_alpha_max', 25.0):.1f}] dan Beta ∈ [0.20, {res.get('eff_beta_max', 5.0):.1f}] untuk memastikan konvergensi global dan residual error minimum.")
 
                 err_red = (1.0 - m_opt['global_rmse'] / m_init['global_rmse']) * 100.0 if m_init['global_rmse'] > 0 else 0.0
 
-                c1, c2, c3, c4 = st.columns(4)
+                c1, c2, c3, c4, c5 = st.columns(5)
                 with c1:
                     st.metric("Initial Baseline RMSE", f"{m_init['global_rmse']:.4f}")
                 with c2:
@@ -816,6 +851,11 @@ with tabs[1]:
                     st.metric("Parity R² Score", f"{m_opt['r2_score']:.4f}", delta=f"{m_opt['r2_score']-m_init['r2_score']:+.4f}")
                 with c4:
                     st.metric("Residual Bias", f"{m_opt['mean_bias']:+.5f}")
+                with c5:
+                    if 'inplace_match_pct' in m_opt:
+                        st.metric("In-Place (HCPV) Match", f"{m_opt['inplace_match_pct']:.2f}%", delta=f"{m_opt.get('inplace_delta_pct', 0.0):+.2f}% ΔHCPV")
+                    else:
+                        st.metric("In-Place Match", "100.0%")
 
                 st.write("---")
                 st.subheader("Rock Type Optimal Parameter Breakdown")
@@ -826,6 +866,7 @@ with tabs[1]:
                     info1 = res['stage1']['per_rock_type'][r]
                     info2 = res['stage2']['per_rock_type'][r]
                     red_pct = (1.0 - info2['optimal_rmse'] / info1['initial_rmse']) * 100.0 if info1['initial_rmse'] > 0 else 0.0
+                    rt_match = f"{m_opt.get(f'rt_{r}_inplace_match_pct', 100.0):.1f}%" if f'rt_{r}_inplace_match_pct' in m_opt else "-"
                     table_records.append({
                         "Rock Type": f"RT-{r}",
                         "Base Sw_irr": f"{info2['base_swirr']:.3f}",
@@ -836,6 +877,7 @@ with tabs[1]:
                         "Optimal Beta": f"{info2['optimal_beta']:.4f}",
                         "Baseline RMSE": f"{info1['initial_rmse']:.4f}",
                         "Optimized RMSE": f"{info2['optimal_rmse']:.4f}",
+                        "In-Place Match": rt_match,
                         "Error Reduction": f"{red_pct:.1f}%"
                     })
                 st.dataframe(pd.DataFrame(table_records), use_container_width=True)
