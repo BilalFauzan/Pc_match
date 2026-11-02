@@ -131,22 +131,24 @@ def compute_residual_loss(
         return float(np.sqrt(np.sum(weights * (err ** 2)) / sum_w))
 
 
-def compute_layer_inplace_metrics(
-    layer_indices: np.ndarray,
+def compute_equilibrium_zone_inplace_metrics(
+    eqlnum_array: np.ndarray,
     sw_static: np.ndarray,
     sw_dynamic: np.ndarray,
     poro: np.ndarray,
     depth: np.ndarray,
     ntg: Optional[np.ndarray] = None,
-    sw_dynamic_init: Optional[np.ndarray] = None
+    sw_dynamic_init: Optional[np.ndarray] = None,
+    multi_params: Optional[Dict[int, Any]] = None
 ) -> List[Dict[str, Any]]:
     """
-    Compute reservoir layer-by-layer In-Place (HCPV) conformance and Sw saturation matching metrics.
+    Compute reservoir In-Place (HCPV) conformance and Sw saturation matching metrics
+    broken down per Equilibrium Zone / Compartment (EQLNUM / EQUIL region).
 
     Parameters
     ----------
-    layer_indices : np.ndarray
-        Array of layer numbers (K index, 1-based) for each active cell.
+    eqlnum_array : np.ndarray
+        Array of equilibrium region numbers (EQLNUM) for each active cell.
     sw_static : np.ndarray
         Static water saturation array (e.g. Petrel SWAT).
     sw_dynamic : np.ndarray
@@ -159,30 +161,32 @@ def compute_layer_inplace_metrics(
         Net-to-Gross array (defaults to 1.0 if not provided).
     sw_dynamic_init : np.ndarray, optional
         Initial uncalibrated dynamic water saturation array (for before vs after comparison).
+    multi_params : dict, optional
+        Dictionary mapping region_id -> EquilibrationParams (to extract WOC/FWL and datum).
 
     Returns
     -------
     List[Dict[str, Any]]
-        List of layer metric dicts sorted by layer number.
+        List of equilibrium zone metric dicts sorted by region ID.
     """
-    unique_layers = np.unique(layer_indices)
+    unique_regions = [int(r) for r in np.unique(eqlnum_array) if r > 0]
     records = []
     w_all = poro * (ntg if ntg is not None else 1.0)
 
-    for k in sorted(unique_layers):
-        mask_k = (layer_indices == k)
-        n_cells = int(np.sum(mask_k))
+    for r in sorted(unique_regions):
+        mask_r = (eqlnum_array == r)
+        n_cells = int(np.sum(mask_r))
         if n_cells == 0:
             continue
 
-        z_mean = float(np.mean(depth[mask_k]))
-        poro_mean = float(np.mean(poro[mask_k]))
-        sw_stat_mean = float(np.mean(sw_static[mask_k]))
-        sw_dyn_mean = float(np.mean(sw_dynamic[mask_k]))
+        z_mean = float(np.mean(depth[mask_r]))
+        poro_mean = float(np.mean(poro[mask_r]))
+        sw_stat_mean = float(np.mean(sw_static[mask_r]))
+        sw_dyn_mean = float(np.mean(sw_dynamic[mask_r]))
 
-        w_k = w_all[mask_k]
-        hcpv_stat = float(np.sum(w_k * np.maximum(0.0, 1.0 - sw_static[mask_k])))
-        hcpv_dyn = float(np.sum(w_k * np.maximum(0.0, 1.0 - sw_dynamic[mask_k])))
+        w_r = w_all[mask_r]
+        hcpv_stat = float(np.sum(w_r * np.maximum(0.0, 1.0 - sw_static[mask_r])))
+        hcpv_dyn = float(np.sum(w_r * np.maximum(0.0, 1.0 - sw_dynamic[mask_r])))
 
         if hcpv_stat > 1e-6:
             match_pct = float(max(0.0, (1.0 - abs(hcpv_dyn - hcpv_stat) / hcpv_stat) * 100.0))
@@ -191,11 +195,17 @@ def compute_layer_inplace_metrics(
             match_pct = 100.0 if hcpv_dyn < 1e-6 else 0.0
             delta_pct = 0.0 if hcpv_dyn < 1e-6 else 100.0
 
-        rmse = float(np.sqrt(np.mean((sw_dynamic[mask_k] - sw_static[mask_k]) ** 2)))
-        mae = float(np.mean(np.abs(sw_dynamic[mask_k] - sw_static[mask_k])))
+        rmse = float(np.sqrt(np.mean((sw_dynamic[mask_r] - sw_static[mask_r]) ** 2)))
+        mae = float(np.mean(np.abs(sw_dynamic[mask_r] - sw_static[mask_r])))
+
+        woc_val = None
+        if multi_params and r in multi_params:
+            woc_val = getattr(multi_params[r], 'fwl_depth', None)
 
         rec = {
-            'layer': int(k),
+            'region': int(r),
+            'zone_label': f"Zone {int(r)}" if len(unique_regions) > 1 else "Full Reservoir",
+            'woc_depth': woc_val,
             'cells': n_cells,
             'mean_depth': z_mean,
             'mean_poro': poro_mean,
@@ -210,13 +220,13 @@ def compute_layer_inplace_metrics(
         }
 
         if sw_dynamic_init is not None:
-            sw_init_mean = float(np.mean(sw_dynamic_init[mask_k]))
-            hcpv_init = float(np.sum(w_k * np.maximum(0.0, 1.0 - sw_dynamic_init[mask_k])))
+            sw_init_mean = float(np.mean(sw_dynamic_init[mask_r]))
+            hcpv_init = float(np.sum(w_r * np.maximum(0.0, 1.0 - sw_dynamic_init[mask_r])))
             if hcpv_stat > 1e-6:
                 match_init = float(max(0.0, (1.0 - abs(hcpv_init - hcpv_stat) / hcpv_stat) * 100.0))
             else:
                 match_init = 100.0 if hcpv_init < 1e-6 else 0.0
-            rmse_init = float(np.sqrt(np.mean((sw_dynamic_init[mask_k] - sw_static[mask_k]) ** 2)))
+            rmse_init = float(np.sqrt(np.mean((sw_dynamic_init[mask_r] - sw_static[mask_r]) ** 2)))
             rec['mean_sw_init'] = sw_init_mean
             rec['hcpv_init'] = hcpv_init
             rec['inplace_match_init_pct'] = match_init
@@ -226,6 +236,11 @@ def compute_layer_inplace_metrics(
         records.append(rec)
 
     return records
+
+
+# Aliases for backward compatibility
+compute_zone_inplace_metrics = compute_equilibrium_zone_inplace_metrics
+compute_layer_inplace_metrics = compute_equilibrium_zone_inplace_metrics
 
 
 class PcOptimizer:
