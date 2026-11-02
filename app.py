@@ -201,6 +201,16 @@ with st.sidebar.expander("⚙️ Konfigurasi Keyword Properti Grid", expanded=Fa
     else:
         min_poro = 0.0
 
+with st.sidebar.expander("📐 Dimensi Grid & Lapisan Reservoar (NX, NY, NZ)", expanded=False):
+    st.caption("Konfigurasi dimensi sel grid 3D untuk memetakan indeks lapisan vertikal (K-Layer) dan evaluasi In-Place (HCPV) match per layer.")
+    col_nx, col_ny, col_nz = st.columns(3)
+    with col_nx:
+        in_nx = st.number_input("NX", value=328, min_value=1, step=1, help="Jumlah sel arah X (I)")
+    with col_ny:
+        in_ny = st.number_input("NY", value=803, min_value=1, step=1, help="Jumlah sel arah Y (J)")
+    with col_nz:
+        in_nz = st.number_input("NZ", value=108, min_value=1, step=1, help="Jumlah lapisan vertikal arah Z (K)")
+
 scan_res = None
 if uploaded_grid:
     grid_filepath = os.path.join(temp_dir, uploaded_grid.name)
@@ -209,7 +219,7 @@ if uploaded_grid:
     st.sidebar.caption(f"✓ Grid: `{uploaded_grid.name}` ({len(uploaded_grid.getbuffer())/1024/1024:.1f} MB)")
 
     # Reset session state if a different grid file is uploaded
-    current_sig = f"{uploaded_grid.name}_{len(uploaded_grid.getbuffer())}_{kw_rt}_{min_poro}"
+    current_sig = f"{uploaded_grid.name}_{len(uploaded_grid.getbuffer())}_{kw_rt}_{min_poro}_{in_nx}_{in_ny}_{in_nz}"
     if st.session_state.get('last_grid_signature') != current_sig:
         st.session_state['grid_data'] = None
         st.session_state['opt_results'] = None
@@ -540,6 +550,23 @@ with tabs[0]:
                     st.warning("⚠️ Tidak ada sel reservoar aktif yang memenuhi kriteria (Rock Type > 0 dan Porositas >= cutoff). Periksa kembali nilai cut-off atau keyword Rock Type.")
                     st.stop()
 
+                # Determine layer index for active reservoir cells
+                act_idx = np.where(active_mask)[0]
+                expected_cells = in_nx * in_ny * in_nz
+                if tot_cells == expected_cells:
+                    # Fortran ordering in Eclipse / Petrel corner-point grids: index = i + j*NX + k*NX*NY
+                    layer_active = (act_idx // (in_nx * in_ny)) + 1
+                    layer_mode = f"Corner Point Grid Index (NX={in_nx}, NY={in_ny}, NZ={in_nz})"
+                else:
+                    num_bins = min(int(in_nz), 50)
+                    depth_act = depth_grid[active_mask]
+                    try:
+                        layer_active = pd.qcut(depth_act, q=num_bins, labels=False, duplicates='drop') + 1
+                        layer_mode = f"Depth Quantile Slicing ({len(np.unique(layer_active))} Layers)"
+                    except Exception:
+                        layer_active = pd.cut(depth_act, bins=num_bins, labels=False) + 1
+                        layer_mode = f"Uniform Depth Bins ({num_bins} Layers)"
+
                 # Load SCAL Manager
                 scal_mgr = pcm.SCALManager(temp_dir)
                 if custom_scal_files:
@@ -617,6 +644,9 @@ with tabs[0]:
                     'sw_static_active': sw_static_grid[active_mask],
                     'ntg_active': ntg_grid[active_mask] if ntg_grid is not None else np.ones(np.sum(active_mask), dtype=np.float32),
                     'eqlnum_active': eqlnum_grid[active_mask] if eqlnum_grid is not None else np.ones(np.sum(active_mask), dtype=int),
+                    'layer_active': np.array(layer_active, dtype=np.int32),
+                    'layer_mode': layer_mode,
+                    'grid_dims': (in_nx, in_ny, in_nz),
                     'density_records': density_records,
                     'equil_records': equil_records,
                     'multi_params': multi_params,
@@ -804,12 +834,24 @@ with tabs[1]:
                     m_stg1 = res_stage1['optimal_metrics']
                     m_stg2 = res_stage2['optimal_metrics']
 
+                    # Compute Layer-by-Layer In-Place Metrics
+                    layer_records = pcm.compute_layer_inplace_metrics(
+                        layer_indices=gd['layer_active'],
+                        sw_static=gd['sw_static_active'],
+                        sw_dynamic=sw_dyn_opt,
+                        poro=gd['poro_active'],
+                        depth=gd['depth_active'],
+                        ntg=gd.get('ntg_active'),
+                        sw_dynamic_init=sw_dyn_init
+                    )
+
                     st.session_state['opt_results'] = {
                         'stage1': res_stage1,
                         'stage2': res_stage2,
                         'init_metrics': m_init,
                         'stg1_metrics': m_stg1,
                         'stg2_metrics': m_stg2,
+                        'layer_records': layer_records,
                         'oil_mask': oil_mask,
                         'sw_dyn_init': sw_dyn_init,
                         'sw_dyn_mult': sw_dyn_mult,
@@ -882,6 +924,134 @@ with tabs[1]:
                     })
                 st.dataframe(pd.DataFrame(table_records), use_container_width=True)
 
+                # -------------------------------------------------------------
+                # RESERVOIR LAYER IN-PLACE (HCPV) MATCH BREAKDOWN
+                # -------------------------------------------------------------
+                layer_recs = res.get('layer_records', [])
+                if layer_recs:
+                    st.write("---")
+                    st.subheader("📚 Reservoir Layer In-Place (HCPV) Match Breakdown")
+                    st.caption(f"Evaluasi keselarasan saturasi air dan kesesuaian volume hidrokarbon di tempat (HCPV In-Place) per lapisan vertikal model reservoar ({gd.get('layer_mode', 'K-Layer')}).")
+
+                    df_layers = pd.DataFrame(layer_recs)
+                    d_unit = gd.get('d_unit', 'm')
+
+                    # KPI Cards for Layer Match
+                    tot_layers = len(df_layers)
+                    avg_match = df_layers['inplace_match_pct'].mean()
+                    pv_weighted_match = res['stg2_metrics'].get('inplace_match_pct', 100.0)
+                    best_row = df_layers.loc[df_layers['inplace_match_pct'].idxmax()]
+                    worst_row = df_layers.loc[df_layers['inplace_match_pct'].idxmin()]
+
+                    lk1, lk2, lk3, lk4 = st.columns(4)
+                    with lk1:
+                        st.metric("Active Reservoir Layers", f"{tot_layers} Layers", help="Jumlah lapisan vertikal yang memiliki sel pay reservoar aktif")
+                    with lk2:
+                        st.metric("Total Reservoir HCPV Match", f"{pv_weighted_match:.2f}%", delta=f"{res['stg2_metrics'].get('inplace_delta_pct', 0.0):+.2f}% ΔHCPV")
+                    with lk3:
+                        st.metric("Average Layer Match", f"{avg_match:.1f}%", help="Rata-rata kesesuaian in-place per lapisan reservoar")
+                    with lk4:
+                        st.metric("Best Conforming Layer", f"Layer {int(best_row['layer'])}", delta=f"{best_row['inplace_match_pct']:.1f}% Match")
+
+                    # Interactive Plotly Chart: HCPV Bar & Match % Line
+                    fig_lay = make_subplots(specs=[[{"secondary_y": True}]])
+                    
+                    fig_lay.add_trace(
+                        go.Bar(
+                            x=df_layers['layer'],
+                            y=df_layers['hcpv_stat'],
+                            name="Static HCPV (Petrel)",
+                            marker_color="#2b5c8f",
+                            opacity=0.75,
+                            hovertemplate="Layer %{x}<br>Static HCPV: %{y:.2f}<extra></extra>"
+                        ),
+                        secondary_y=False
+                    )
+                    
+                    if 'hcpv_init' in df_layers.columns:
+                        fig_lay.add_trace(
+                            go.Bar(
+                                x=df_layers['layer'],
+                                y=df_layers['hcpv_init'],
+                                name="Baseline HCPV (Uncalibrated)",
+                                marker_color="#888888",
+                                opacity=0.45,
+                                visible='legendonly',
+                                hovertemplate="Layer %{x}<br>Baseline HCPV: %{y:.2f}<extra></extra>"
+                            ),
+                            secondary_y=False
+                        )
+
+                    fig_lay.add_trace(
+                        go.Bar(
+                            x=df_layers['layer'],
+                            y=df_layers['hcpv_dyn'],
+                            name="Optimized HCPV (Dynamic)",
+                            marker_color="#28a745",
+                            opacity=0.85,
+                            hovertemplate="Layer %{x}<br>Optimized HCPV: %{y:.2f}<extra></extra>"
+                        ),
+                        secondary_y=False
+                    )
+
+                    fig_lay.add_trace(
+                        go.Scatter(
+                            x=df_layers['layer'],
+                            y=df_layers['inplace_match_pct'],
+                            name="In-Place Match (%)",
+                            mode="lines+markers",
+                            line=dict(color="#d9534f", width=2.5),
+                            marker=dict(size=5, color="#d9534f"),
+                            hovertemplate="Layer %{x}<br>Match: %{y:.1f}%<extra></extra>"
+                        ),
+                        secondary_y=True
+                    )
+
+                    # Reference benchmark line at 90% match
+                    fig_lay.add_hline(y=90.0, line_dash="dot", line_color="rgba(217, 83, 79, 0.4)", secondary_y=True)
+
+                    fig_lay.update_layout(
+                        title="<b>Layer-by-Layer In-Place (HCPV) Comparison & Conformance Percentage</b>",
+                        xaxis_title="<b>Reservoir Layer (K)</b>",
+                        barmode="group",
+                        template="plotly_white",
+                        height=460,
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                    )
+                    fig_lay.update_yaxes(title_text="<b>Hydrocarbon Pore Volume (HCPV) [arb. unit]</b>", secondary_y=False)
+                    fig_lay.update_yaxes(title_text="<b>In-Place Match [%]</b>", range=[0, 105], secondary_y=True)
+
+                    st.plotly_chart(fig_lay, use_container_width=True)
+
+                    # Formatted Layer Table
+                    layer_cols = {
+                        "Layer (K)": df_layers['layer'],
+                        "Active Cells": df_layers['cells'].map(lambda x: f"{x:,}"),
+                        f"Mean TVD [{d_unit}]": df_layers['mean_depth'].map(lambda x: f"{x:.1f}"),
+                        "Mean Poro": df_layers['mean_poro'].map(lambda x: f"{x:.3f}"),
+                        "Static Sw": df_layers['mean_sw_stat'].map(lambda x: f"{x:.3f}"),
+                        "Optimized Sw": df_layers['mean_sw_dyn'].map(lambda x: f"{x:.3f}"),
+                        "Static HCPV": df_layers['hcpv_stat'].map(lambda x: f"{x:.2f}"),
+                        "Optimized HCPV": df_layers['hcpv_dyn'].map(lambda x: f"{x:.2f}"),
+                        "In-Place Match": df_layers['inplace_match_pct'].map(lambda x: f"{x:.1f}%"),
+                        "ΔHCPV": df_layers['delta_hcpv_pct'].map(lambda x: f"{x:+.1f}%"),
+                        "RMSE": df_layers['rmse'].map(lambda x: f"{x:.4f}")
+                    }
+                    if 'inplace_match_init_pct' in df_layers.columns:
+                        layer_cols["Baseline Match"] = df_layers['inplace_match_init_pct'].map(lambda x: f"{x:.1f}%")
+                        layer_cols["Match Improvement"] = df_layers['match_improvement_pct'].map(lambda x: f"{x:+.1f}%")
+
+                    st.dataframe(pd.DataFrame(layer_cols), use_container_width=True, height=350)
+
+                    # CSV Export button for layer data
+                    csv_layer_data = df_layers.to_csv(index=False).encode('utf-8')
+                    st.download_button(
+                        label="⬇️ Download Layer In-Place Match Summary (.CSV)",
+                        data=csv_layer_data,
+                        file_name="Reservoir_Layer_InPlace_Match_Summary.csv",
+                        mime="text/csv"
+                    )
+
 
 # -----------------------------------------------------------------------------
 # TAB 3: DIAGNOSTIC VISUALIZATIONS
@@ -901,7 +1071,8 @@ with tabs[2]:
                 "1. SCAL Capillary Pressure Curves (Pc vs Sw)",
                 "2. Saturation vs. True Vertical Depth (Sw vs TVD)",
                 "3. Parity Cross-Plots Progression (Static vs Dynamic)",
-                "4. Residual Error Distribution Analysis"
+                "4. Residual Error Distribution Analysis",
+                "5. Reservoir Layer-by-Layer Sw & HCPV Profiles (Vertical Conformance)"
             ]
         )
 
@@ -1008,6 +1179,121 @@ with tabs[2]:
             fig.add_trace(go.Histogram(x=err_opt, name="Optimized Residual Error", opacity=0.6, marker_color="red", nbinsx=60))
             fig.update_layout(barmode='overlay', xaxis_title="Saturation Error ΔSw = Sw_dyn - Sw_stat", yaxis_title="Cell Frequency", template="plotly_white", height=450)
             st.plotly_chart(fig, use_container_width=True)
+
+        elif "5. Reservoir Layer-by-Layer" in diag_choice:
+            st.subheader("Reservoir Layer-by-Layer Sw & In-Place (HCPV) Profiles")
+            st.caption("Profil conformance vertikal per lapisan reservoar (K-Layer) menyerupai well log composite profile.")
+            
+            layer_recs = res.get('layer_records', [])
+            if not layer_recs:
+                st.warning("Data lapisan belum tersedia. Jalankan optimasi pada Tab 2 terlebih dahulu.")
+            else:
+                df_lay = pd.DataFrame(layer_recs)
+                d_unit = gd.get('d_unit', 'm')
+
+                fig_prof = make_subplots(
+                    rows=1, cols=3,
+                    shared_yaxes=True,
+                    subplot_titles=[
+                        "<b>Average Water Saturation (Sw)</b>",
+                        "<b>Hydrocarbon Pore Volume (HCPV)</b>",
+                        "<b>Layer In-Place Match [%]</b>"
+                    ]
+                )
+
+                # Subplot 1: Sw profile vs Layer K
+                if 'mean_sw_init' in df_lay.columns:
+                    fig_prof.add_trace(
+                        go.Scatter(
+                            x=df_lay['mean_sw_init'],
+                            y=df_lay['layer'],
+                            mode='lines+markers',
+                            name='Baseline Sw Dyn',
+                            line=dict(color='#888888', dash='dash'),
+                            marker=dict(size=4)
+                        ),
+                        row=1, col=1
+                    )
+                fig_prof.add_trace(
+                    go.Scatter(
+                        x=df_lay['mean_sw_stat'],
+                        y=df_lay['layer'],
+                        mode='lines+markers',
+                        name='Static Sw (Petrel)',
+                        line=dict(color='#2b5c8f', width=2),
+                        marker=dict(size=4)
+                    ),
+                    row=1, col=1
+                )
+                fig_prof.add_trace(
+                    go.Scatter(
+                        x=df_lay['mean_sw_dyn'],
+                        y=df_lay['layer'],
+                        mode='lines+markers',
+                        name='Optimized Dynamic Sw',
+                        line=dict(color='#28a745', width=2.5),
+                        marker=dict(size=5)
+                    ),
+                    row=1, col=1
+                )
+
+                # Subplot 2: HCPV profile vs Layer K
+                fig_prof.add_trace(
+                    go.Bar(
+                        x=df_lay['hcpv_stat'],
+                        y=df_lay['layer'],
+                        orientation='h',
+                        name='Static HCPV',
+                        marker_color='#2b5c8f',
+                        opacity=0.75
+                    ),
+                    row=1, col=2
+                )
+                fig_prof.add_trace(
+                    go.Bar(
+                        x=df_lay['hcpv_dyn'],
+                        y=df_lay['layer'],
+                        orientation='h',
+                        name='Optimized HCPV',
+                        marker_color='#28a745',
+                        opacity=0.85
+                    ),
+                    row=1, col=2
+                )
+
+                # Subplot 3: Match % vs Layer K
+                fig_prof.add_trace(
+                    go.Scatter(
+                        x=df_lay['inplace_match_pct'],
+                        y=df_lay['layer'],
+                        mode='lines+markers',
+                        name='In-Place Match %',
+                        line=dict(color='#d9534f', width=2),
+                        marker=dict(size=5, color='#d9534f')
+                    ),
+                    row=1, col=3
+                )
+                # Benchmark line at 90%
+                fig_prof.add_vline(x=90.0, line_dash="dot", line_color="rgba(217, 83, 79, 0.5)", row=1, col=3)
+
+                # Layout formatting
+                fig_prof.update_xaxes(title_text="Water Saturation [frac]", range=[0, 1.05], row=1, col=1)
+                fig_prof.update_xaxes(title_text="HCPV [arb. unit]", row=1, col=2)
+                fig_prof.update_xaxes(title_text="Match [%]", range=[0, 105], row=1, col=3)
+
+                # Y-axes: Invert Layer axis so shallow layers (K=1) are at the top, deep layers at bottom
+                fig_prof.update_yaxes(title_text="<b>Reservoir Layer (K)</b>", autorange="reversed", row=1, col=1)
+                fig_prof.update_yaxes(autorange="reversed", row=1, col=2)
+                fig_prof.update_yaxes(autorange="reversed", row=1, col=3)
+
+                fig_prof.update_layout(
+                    height=580,
+                    template="plotly_white",
+                    showlegend=True,
+                    legend=dict(orientation="h", yanchor="bottom", y=1.04, xanchor="center", x=0.5)
+                )
+
+                st.plotly_chart(fig_prof, use_container_width=True)
 
 
 # -----------------------------------------------------------------------------
