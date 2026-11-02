@@ -19,17 +19,19 @@ from .equilibrator import ReservoirEquilibrator
 
 class OptimizationMetrics:
     """
-    Evaluator for spatial saturation matching quality.
+    Evaluator for spatial saturation matching quality and in-place volumetric consistency.
     """
 
     @staticmethod
     def compute(
         sw_static: np.ndarray,
         sw_dynamic: np.ndarray,
-        rt_array: Optional[np.ndarray] = None
+        rt_array: Optional[np.ndarray] = None,
+        weights: Optional[np.ndarray] = None
     ) -> Dict[str, float]:
         """
-        Compute comprehensive spatial mismatch metrics between static and dynamic Sw.
+        Compute comprehensive spatial mismatch metrics between static and dynamic Sw,
+        including pore-volume weighted metrics and In-Place Hydrocarbon Pore Volume (HCPV) match.
         
         Metrics:
         - RMSE (Root Mean Squared Error)
@@ -37,13 +39,13 @@ class OptimizationMetrics:
         - Max Error
         - Bias (Mean Signed Difference: Sw_dyn - Sw_stat)
         - R2 (Coefficient of Determination)
-        - Per-Rock-Type RMSE and MAE
+        - In-Place Match % (HCPV Dynamic vs HCPV Static)
+        - Per-Rock-Type RMSE, MAE, and In-Place Match %
         """
         diff = sw_dynamic - sw_static
         sq_diff = diff ** 2
         abs_diff = np.abs(diff)
 
-        n = len(sw_static)
         rmse = float(np.sqrt(np.mean(sq_diff)))
         mae = float(np.mean(abs_diff))
         max_err = float(np.max(abs_diff))
@@ -62,6 +64,27 @@ class OptimizationMetrics:
             'r2_score': r2
         }
 
+        # Volumetric / In-Place metrics if weights (Pore Volume) provided
+        if weights is not None:
+            sum_w = float(np.sum(weights))
+            if sum_w > 0:
+                weighted_rmse = float(np.sqrt(np.sum(weights * sq_diff) / sum_w))
+                weighted_mae = float(np.sum(weights * abs_diff) / sum_w)
+                hcpv_stat = float(np.sum(weights * np.maximum(0.0, 1.0 - sw_static)))
+                hcpv_dyn = float(np.sum(weights * np.maximum(0.0, 1.0 - sw_dynamic)))
+                delta_hcpv = hcpv_dyn - hcpv_stat
+                inplace_match_pct = float(max(0.0, (1.0 - abs(delta_hcpv) / hcpv_stat) * 100.0)) if hcpv_stat > 0 else 100.0
+                inplace_delta_pct = float((delta_hcpv / hcpv_stat) * 100.0) if hcpv_stat > 0 else 0.0
+
+                metrics.update({
+                    'weighted_rmse': weighted_rmse,
+                    'weighted_mae': weighted_mae,
+                    'hcpv_static': hcpv_stat,
+                    'hcpv_dynamic': hcpv_dyn,
+                    'inplace_match_pct': inplace_match_pct,
+                    'inplace_delta_pct': inplace_delta_pct
+                })
+
         if rt_array is not None:
             unique_rts = np.unique(rt_array)
             for rt in unique_rts:
@@ -71,13 +94,47 @@ class OptimizationMetrics:
                 if np.any(mask):
                     metrics[f'rt_{int(rt)}_rmse'] = float(np.sqrt(np.mean(sq_diff[mask])))
                     metrics[f'rt_{int(rt)}_mae'] = float(np.mean(abs_diff[mask]))
+                    if weights is not None:
+                        w_rt = weights[mask]
+                        sum_w_rt = float(np.sum(w_rt))
+                        if sum_w_rt > 0:
+                            hcpv_s = float(np.sum(w_rt * np.maximum(0.0, 1.0 - sw_static[mask])))
+                            hcpv_d = float(np.sum(w_rt * np.maximum(0.0, 1.0 - sw_dynamic[mask])))
+                            m_pct = float(max(0.0, (1.0 - abs(hcpv_d - hcpv_s) / hcpv_s) * 100.0)) if hcpv_s > 0 else 100.0
+                            metrics[f'rt_{int(rt)}_inplace_match_pct'] = m_pct
 
         return metrics
+
+
+def compute_residual_loss(
+    err: np.ndarray,
+    weights: np.ndarray,
+    loss_type: str = "Huber Loss (Robust)",
+    delta: float = 0.10
+) -> float:
+    """
+    Compute weighted objective loss supporting Huber, L1 (MAE), or L2 (RMSE).
+    Huber loss provides extreme robustness against wide scatter and outliers.
+    """
+    sum_w = float(np.sum(weights))
+    if sum_w <= 0.0:
+        return 0.0
+
+    abs_err = np.abs(err)
+    lt = loss_type.lower()
+    if "huber" in lt:
+        huber_err = np.where(abs_err <= delta, 0.5 * (err ** 2), delta * abs_err - 0.5 * (delta ** 2))
+        return float(np.sum(weights * huber_err) / sum_w)
+    elif "mae" in lt or "l1" in lt:
+        return float(np.sum(weights * abs_err) / sum_w)
+    else:  # Standard L2 RMSE
+        return float(np.sqrt(np.sum(weights * (err ** 2)) / sum_w))
 
 
 class PcOptimizer:
     """
     Automated optimizer for Rock-Type Capillary Pressure multipliers, endpoints, and curvature.
+    Supports Pore-Volume Weighting (direct In-Place / STOIIP matching) and Robust Huber Loss.
     """
 
     def __init__(
@@ -86,13 +143,28 @@ class PcOptimizer:
         depth_active: np.ndarray,
         rt_active: np.ndarray,
         sw_static_active: np.ndarray,
-        eqlnum_active: Optional[np.ndarray] = None
+        eqlnum_active: Optional[np.ndarray] = None,
+        poro_active: Optional[np.ndarray] = None,
+        ntg_active: Optional[np.ndarray] = None,
+        pv_weights: Optional[np.ndarray] = None
     ):
         self.equilibrator = equilibrator
         self.depth_active = depth_active
         self.rt_active = rt_active
         self.sw_static_active = sw_static_active
         self.eqlnum_active = eqlnum_active
+        self.poro_active = poro_active
+        self.ntg_active = ntg_active
+
+        # Calculate cell pore volume weights for volumetric in-place matching
+        if pv_weights is not None:
+            self.pv_weights = pv_weights.astype(np.float32)
+        elif poro_active is not None:
+            ntg = ntg_active if ntg_active is not None else 1.0
+            self.pv_weights = np.maximum(1e-4, (poro_active * ntg)).astype(np.float32)
+        else:
+            self.pv_weights = np.ones_like(depth_active, dtype=np.float32)
+
         self.active_rts = [int(r) for r in np.unique(rt_active) if r > 0 and r in equilibrator.scal_manager.tables]
         self.iteration_history = []
 
@@ -132,14 +204,19 @@ class PcOptimizer:
     def optimize_independent(
         self,
         bounds: Tuple[float, float] = (0.01, 50.0),
-        tolerance: float = 1e-4
+        tolerance: float = 1e-4,
+        weighting_mode: str = "Pore Volume (PV-Weighted)",
+        loss_type: str = "Huber Loss (Robust to Scatter)",
+        huber_delta: float = 0.10
     ) -> Dict[str, Any]:
         """
         Stage 1: Multiplier-only optimization using 1D bounded Brent search.
         Optimizes alpha_r for each rock type with fixed baseline endpoints.
+        Supports Pore Volume Weighting and Huber Loss.
         """
         optimal_multipliers = {}
         rt_results = {}
+        use_pv = "pore volume" in weighting_mode.lower() or "pv" in weighting_mode.lower()
 
         pc_hydro = self.equilibrator.compute_hydrostatic_pc(self.depth_active, eqlnum_array=self.eqlnum_active)
 
@@ -150,6 +227,7 @@ class PcOptimizer:
 
             pc_h = pc_hydro[mask]
             target_sw = self.sw_static_active[mask]
+            cell_w = self.pv_weights[mask] if use_pv else np.ones(np.sum(mask), dtype=np.float32)
             table = self.equilibrator.scal_manager.tables[rt]
 
             pc_pts = table.base_pcow[::-1]
@@ -158,22 +236,27 @@ class PcOptimizer:
             def rt_loss(alpha: float) -> float:
                 pc_eff = pc_h / alpha
                 sw_est = np.interp(pc_eff, pc_pts, sw_pts, left=1.0, right=sw_pts[-1])
-                return float(np.sqrt(np.mean((sw_est - target_sw) ** 2)))
+                return compute_residual_loss(sw_est - target_sw, cell_w, loss_type=loss_type, delta=huber_delta)
 
-            init_rmse = rt_loss(1.0)
+            init_loss = rt_loss(1.0)
             res = minimize_scalar(rt_loss, bounds=bounds, method='bounded', options={'xatol': tolerance})
 
             opt_alpha = float(res.x)
-            opt_rmse = float(res.fun)
+            pc_eff_opt = pc_h / opt_alpha
+            sw_est_opt = np.interp(pc_eff_opt, pc_pts, sw_pts, left=1.0, right=sw_pts[-1])
+            pure_opt_rmse = float(np.sqrt(np.mean((sw_est_opt - target_sw) ** 2)))
+            init_rmse = float(np.sqrt(np.mean((np.interp(pc_h, pc_pts, sw_pts, left=1.0, right=sw_pts[-1]) - target_sw) ** 2)))
 
             optimal_multipliers[rt] = opt_alpha
             rt_results[rt] = {
                 'initial_multiplier': 1.0,
                 'optimal_multiplier': opt_alpha,
                 'initial_rmse': init_rmse,
-                'optimal_rmse': opt_rmse,
-                'rmse_reduction_pct': (1.0 - opt_rmse / init_rmse) * 100.0 if init_rmse > 0 else 0.0,
-                'iterations': res.nfev
+                'optimal_rmse': pure_opt_rmse,
+                'rmse_reduction_pct': (1.0 - pure_opt_rmse / init_rmse) * 100.0 if init_rmse > 0 else 0.0,
+                'iterations': res.nfev,
+                'weighting_mode': weighting_mode,
+                'loss_type': loss_type
             }
 
         sw_dyn_init = self.equilibrator.calculate_dynamic_sw(
@@ -183,8 +266,8 @@ class PcOptimizer:
             self.depth_active, self.rt_active, optimal_multipliers, eqlnum_array=self.eqlnum_active
         )
 
-        init_metrics = OptimizationMetrics.compute(self.sw_static_active, sw_dyn_init, self.rt_active)
-        opt_metrics = OptimizationMetrics.compute(self.sw_static_active, sw_dyn_opt, self.rt_active)
+        init_metrics = OptimizationMetrics.compute(self.sw_static_active, sw_dyn_init, self.rt_active, weights=self.pv_weights)
+        opt_metrics = OptimizationMetrics.compute(self.sw_static_active, sw_dyn_opt, self.rt_active, weights=self.pv_weights)
 
         return {
             'optimal_multipliers': optimal_multipliers,
@@ -192,7 +275,9 @@ class PcOptimizer:
             'initial_metrics': init_metrics,
             'optimal_metrics': opt_metrics,
             'sw_dynamic_initial': sw_dyn_init,
-            'sw_dynamic_optimal': sw_dyn_opt
+            'sw_dynamic_optimal': sw_dyn_opt,
+            'weighting_mode': weighting_mode,
+            'loss_type': loss_type
         }
 
     def optimize_endpoints(
@@ -205,7 +290,10 @@ class PcOptimizer:
         algorithm: str = "differential_evolution",
         asymptotic_guard: bool = True,
         swirr_tolerance: float = 0.20,
-        min_alpha_guard: float = 0.80
+        min_alpha_guard: float = 0.80,
+        weighting_mode: str = "Pore Volume (PV-Weighted)",
+        loss_type: str = "Huber Loss (Robust to Scatter)",
+        huber_delta: float = 0.10
     ) -> Dict[str, Any]:
         """
         Stage 2 & 3: Joint Multiplier, Endpoint, and Curvature Shape Optimization.
@@ -216,6 +304,8 @@ class PcOptimizer:
         4. Curvature / pore-size distribution shape exponent: beta_r (Option A)
         
         Features:
+        - Pore-Volume Weighting: Directly matches reservoir In-Place hydrocarbon volumes (HCPV).
+        - Huber Loss: Immunizes the optimizer against extreme scatter and outliers (e.g. on RT-4).
         - algorithm: 'differential_evolution' (Global genetic metaheuristic with L-BFGS-B polish),
                      'dual_annealing' (Global simulated annealing), or
                      'L-BFGS-B' (Fast gradient-based local solver).
@@ -226,6 +316,7 @@ class PcOptimizer:
         """
         optimal_params = {}
         rt_results = {}
+        use_pv = "pore volume" in weighting_mode.lower() or "pv" in weighting_mode.lower()
 
         pc_hydro = self.equilibrator.compute_hydrostatic_pc(self.depth_active, eqlnum_array=self.eqlnum_active)
 
@@ -236,6 +327,7 @@ class PcOptimizer:
 
             pc_h = pc_hydro[mask]
             target_sw = self.sw_static_active[mask]
+            cell_w = self.pv_weights[mask] if use_pv else np.ones(np.sum(mask), dtype=np.float32)
             table = self.equilibrator.scal_manager.tables[rt]
 
             base_sw = table.base_sw
@@ -274,12 +366,12 @@ class PcOptimizer:
                         if sc_pc[i] < sc_pc[i + 1]:
                             sc_pc[i] = sc_pc[i + 1]
                     sw_est = np.interp(pc_h, sc_pc[::-1], new_sw[::-1], left=1.0, right=new_sw[0])
-                    rmse_val = float(np.sqrt(np.mean((sw_est - target_sw) ** 2)))
+                    loss_val = compute_residual_loss(sw_est - target_sw, cell_w, loss_type=loss_type, delta=huber_delta)
                     if asymptotic_guard:
                         pen_sw = 0.25 * ((sw_val - base_swirr) / base_swirr) ** 2
                         pen_a = 0.25 * (max(0.0, 1.0 - a_val)) ** 2
-                        return rmse_val + pen_sw + pen_a
-                    return rmse_val
+                        return loss_val + pen_sw + pen_a
+                    return loss_val
 
             elif optimize_entry_pressure:
                 # 3 parameters: [alpha, swirr, pce]
@@ -296,12 +388,12 @@ class PcOptimizer:
                         if sc_pc[i] < sc_pc[i + 1]:
                             sc_pc[i] = sc_pc[i + 1]
                     sw_est = np.interp(pc_h, sc_pc[::-1], new_sw[::-1], left=1.0, right=new_sw[0])
-                    rmse_val = float(np.sqrt(np.mean((sw_est - target_sw) ** 2)))
+                    loss_val = compute_residual_loss(sw_est - target_sw, cell_w, loss_type=loss_type, delta=huber_delta)
                     if asymptotic_guard:
                         pen_sw = 0.25 * ((sw_val - base_swirr) / base_swirr) ** 2
                         pen_a = 0.25 * (max(0.0, 1.0 - a_val)) ** 2
-                        return rmse_val + pen_sw + pen_a
-                    return rmse_val
+                        return loss_val + pen_sw + pen_a
+                    return loss_val
             else:
                 # 2 parameters: [alpha, swirr]
                 x0 = [max(1.0, eff_alpha_bounds[0]), base_swirr]
@@ -317,14 +409,14 @@ class PcOptimizer:
                         if sc_pc[i] < sc_pc[i + 1]:
                             sc_pc[i] = sc_pc[i + 1]
                     sw_est = np.interp(pc_h, sc_pc[::-1], new_sw[::-1], left=1.0, right=new_sw[0])
-                    rmse_val = float(np.sqrt(np.mean((sw_est - target_sw) ** 2)))
+                    loss_val = compute_residual_loss(sw_est - target_sw, cell_w, loss_type=loss_type, delta=huber_delta)
                     if asymptotic_guard:
                         pen_sw = 0.25 * ((sw_val - base_swirr) / base_swirr) ** 2
                         pen_a = 0.25 * (max(0.0, 1.0 - a_val)) ** 2
-                        return rmse_val + pen_sw + pen_a
-                    return rmse_val
+                        return loss_val + pen_sw + pen_a
+                    return loss_val
 
-            init_rmse = obj_joint(x0)
+            init_rmse = float(np.sqrt(np.mean((np.interp(pc_h, base_pc[::-1], base_sw[::-1], left=1.0, right=base_sw[0]) - target_sw) ** 2)))
             algo_key = algorithm.lower().replace("-", "").replace("_", "")
 
             if "differential" in algo_key or "evolution" in algo_key or algo_key == "de":
@@ -388,7 +480,9 @@ class PcOptimizer:
                 'rmse_reduction_pct': (1.0 - pure_opt_rmse / init_rmse) * 100.0 if init_rmse > 0 else 0.0,
                 'iterations': getattr(res, 'nfev', 0),
                 'algorithm': algorithm,
-                'asymptotic_guard': asymptotic_guard
+                'asymptotic_guard': asymptotic_guard,
+                'weighting_mode': weighting_mode,
+                'loss_type': loss_type
             }
 
         sw_dyn_init = self.equilibrator.calculate_dynamic_sw(
@@ -398,8 +492,8 @@ class PcOptimizer:
             self.depth_active, self.rt_active, optimal_params, eqlnum_array=self.eqlnum_active
         )
 
-        init_metrics = OptimizationMetrics.compute(self.sw_static_active, sw_dyn_init, self.rt_active)
-        opt_metrics = OptimizationMetrics.compute(self.sw_static_active, sw_dyn_opt, self.rt_active)
+        init_metrics = OptimizationMetrics.compute(self.sw_static_active, sw_dyn_init, self.rt_active, weights=self.pv_weights)
+        opt_metrics = OptimizationMetrics.compute(self.sw_static_active, sw_dyn_opt, self.rt_active, weights=self.pv_weights)
 
         return {
             'optimal_parameters': optimal_params,
@@ -409,5 +503,7 @@ class PcOptimizer:
             'sw_dynamic_initial': sw_dyn_init,
             'sw_dynamic_optimal': sw_dyn_opt,
             'algorithm': algorithm,
-            'asymptotic_guard': asymptotic_guard
+            'asymptotic_guard': asymptotic_guard,
+            'weighting_mode': weighting_mode,
+            'loss_type': loss_type
         }
