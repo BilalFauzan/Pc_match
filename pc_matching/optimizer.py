@@ -131,6 +131,103 @@ def compute_residual_loss(
         return float(np.sqrt(np.sum(weights * (err ** 2)) / sum_w))
 
 
+def compute_layer_inplace_metrics(
+    layer_indices: np.ndarray,
+    sw_static: np.ndarray,
+    sw_dynamic: np.ndarray,
+    poro: np.ndarray,
+    depth: np.ndarray,
+    ntg: Optional[np.ndarray] = None,
+    sw_dynamic_init: Optional[np.ndarray] = None
+) -> List[Dict[str, Any]]:
+    """
+    Compute reservoir layer-by-layer In-Place (HCPV) conformance and Sw saturation matching metrics.
+
+    Parameters
+    ----------
+    layer_indices : np.ndarray
+        Array of layer numbers (K index, 1-based) for each active cell.
+    sw_static : np.ndarray
+        Static water saturation array (e.g. Petrel SWAT).
+    sw_dynamic : np.ndarray
+        Optimized dynamic equilibrated water saturation array.
+    poro : np.ndarray
+        Porosity array.
+    depth : np.ndarray
+        True vertical depth (TVD) array.
+    ntg : np.ndarray, optional
+        Net-to-Gross array (defaults to 1.0 if not provided).
+    sw_dynamic_init : np.ndarray, optional
+        Initial uncalibrated dynamic water saturation array (for before vs after comparison).
+
+    Returns
+    -------
+    List[Dict[str, Any]]
+        List of layer metric dicts sorted by layer number.
+    """
+    unique_layers = np.unique(layer_indices)
+    records = []
+    w_all = poro * (ntg if ntg is not None else 1.0)
+
+    for k in sorted(unique_layers):
+        mask_k = (layer_indices == k)
+        n_cells = int(np.sum(mask_k))
+        if n_cells == 0:
+            continue
+
+        z_mean = float(np.mean(depth[mask_k]))
+        poro_mean = float(np.mean(poro[mask_k]))
+        sw_stat_mean = float(np.mean(sw_static[mask_k]))
+        sw_dyn_mean = float(np.mean(sw_dynamic[mask_k]))
+
+        w_k = w_all[mask_k]
+        hcpv_stat = float(np.sum(w_k * np.maximum(0.0, 1.0 - sw_static[mask_k])))
+        hcpv_dyn = float(np.sum(w_k * np.maximum(0.0, 1.0 - sw_dynamic[mask_k])))
+
+        if hcpv_stat > 1e-6:
+            match_pct = float(max(0.0, (1.0 - abs(hcpv_dyn - hcpv_stat) / hcpv_stat) * 100.0))
+            delta_pct = float(((hcpv_dyn - hcpv_stat) / hcpv_stat) * 100.0)
+        else:
+            match_pct = 100.0 if hcpv_dyn < 1e-6 else 0.0
+            delta_pct = 0.0 if hcpv_dyn < 1e-6 else 100.0
+
+        rmse = float(np.sqrt(np.mean((sw_dynamic[mask_k] - sw_static[mask_k]) ** 2)))
+        mae = float(np.mean(np.abs(sw_dynamic[mask_k] - sw_static[mask_k])))
+
+        rec = {
+            'layer': int(k),
+            'cells': n_cells,
+            'mean_depth': z_mean,
+            'mean_poro': poro_mean,
+            'mean_sw_stat': sw_stat_mean,
+            'mean_sw_dyn': sw_dyn_mean,
+            'hcpv_stat': hcpv_stat,
+            'hcpv_dyn': hcpv_dyn,
+            'inplace_match_pct': match_pct,
+            'delta_hcpv_pct': delta_pct,
+            'rmse': rmse,
+            'mae': mae
+        }
+
+        if sw_dynamic_init is not None:
+            sw_init_mean = float(np.mean(sw_dynamic_init[mask_k]))
+            hcpv_init = float(np.sum(w_k * np.maximum(0.0, 1.0 - sw_dynamic_init[mask_k])))
+            if hcpv_stat > 1e-6:
+                match_init = float(max(0.0, (1.0 - abs(hcpv_init - hcpv_stat) / hcpv_stat) * 100.0))
+            else:
+                match_init = 100.0 if hcpv_init < 1e-6 else 0.0
+            rmse_init = float(np.sqrt(np.mean((sw_dynamic_init[mask_k] - sw_static[mask_k]) ** 2)))
+            rec['mean_sw_init'] = sw_init_mean
+            rec['hcpv_init'] = hcpv_init
+            rec['inplace_match_init_pct'] = match_init
+            rec['rmse_init'] = rmse_init
+            rec['match_improvement_pct'] = match_pct - match_init
+
+        records.append(rec)
+
+    return records
+
+
 class PcOptimizer:
     """
     Automated optimizer for Rock-Type Capillary Pressure multipliers, endpoints, and curvature.
